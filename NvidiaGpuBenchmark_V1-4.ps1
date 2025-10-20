@@ -4,6 +4,47 @@
 # 1080 ↔ 5090 sabit kalibrasyon; 5090 = 10000 puan
 # ==========================================
 
+# ================================
+# ExecutionPolicy Bootstrap (Self)
+# ================================
+# Aynı blok iki kez çalışmasın
+if (-not $env:__GPU_BOOT_DONE) {
+  $env:__GPU_BOOT_DONE = "1"
+
+  # İmzasız/indirilen dosya engelini temizle (sessiz)
+  try { if ($PSCommandPath) { Unblock-File -Path $PSCommandPath -ErrorAction Stop } } catch {}
+
+  # Önce Process scope'ta Bypass dene
+  try {
+    if ((Get-ExecutionPolicy -Scope Process) -ne 'Bypass') {
+      Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop
+    }
+  } catch {}
+
+  # Etkili policy Bypass değilse kendini Bypass ile yeniden başlat
+  $needRelaunch = $true
+  try { if ((Get-ExecutionPolicy) -eq 'Bypass') { $needRelaunch = $false } } catch {}
+
+  if ($needRelaunch -and $PSCommandPath) {
+    # Çalıştırılacak PowerShell yolu (önce pwsh, yoksa Windows PowerShell)
+    $psExe = $null
+    try { $psExe = (Get-Command pwsh -ErrorAction Stop).Source } catch {}
+    if (-not $psExe) {
+      $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    }
+
+    # Argümanları koruyarak yeniden çağır
+    $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"") + $args
+    try {
+      & $psExe @argList
+      exit $LASTEXITCODE
+    } catch {
+      # Yeniden başlatma başarısızsa mevcut oturumda devam
+    }
+  }
+}
+
+
 # -- NVML P/Invoke türünü yalnızca bir kez ekle --
 if (-not ('NvmlWrapper' -as [type])) {
 Add-Type -TypeDefinition @"
@@ -14,6 +55,12 @@ public static class NvmlWrapper {
     public static extern int nvmlInit_v2();
     [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)]
     public static extern int nvmlShutdown();
+
+    # NvmlWrapper içine ekle
+[DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)]
+public static extern int nvmlDeviceGetPowerManagementLimitConstraints(
+    IntPtr device, out uint minLimitMilliWatts, out uint maxLimitMilliWatts);
+
 
     [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)]
     public static extern int nvmlDeviceGetHandleByIndex_v2(uint index, out IntPtr device);
@@ -323,33 +370,69 @@ try {
   $comp  = Compute-Composite -tf $tf -rawBW $rawBW -arch $arch
   $score = Score-FromComposite $comp
 
-# --- Güç normalizasyonu (form-factor aware) + otomatik mobil uplift ---
-[uint32]$pl = 0; [int]$plRc = -1
-try { $plRc = [NvmlWrapper]::nvmlDeviceGetEnforcedPowerLimit($dev,[ref]$pl) } catch { $plRc = -1 }
-if ($plRc -ne 0 -or $pl -le 0) {
-  try {
-    $pl = 0
-    if ([NvmlWrapper]::nvmlDeviceGetPowerManagementDefaultLimit($dev,[ref]$pl) -ne 0) { $pl = 0 }
-  } catch { $pl = 0 }
-}
-
+# -------------------------------
+# Mode-proof güç normalizasyonu
+# -------------------------------
+# Form factor
 [string]$ff = Get-FormFactorTag -gpuName $name
-[double]$P_ref  = [double]$FormFactor[$ff].P_ref
+[double]$P_ref  = [double]$FormFactor[$ff].P_ref    # Laptop:120000, Desktop:160000
 [double]$PowExp = [double]$FormFactor[$ff].Exp
-if ($pl -le 0) { $pl = if ($ff -eq 'Laptop') { 120000 } else { 160000 } }
 
-[double]$PowerFac = [math]::Pow(([double]$pl)/$P_ref, $PowExp)
+# Kartın donanımsal PL üst sınırını al (mode'dan bağımsız)
+[uint32]$plMax = 0; [uint32]$plMin = 0
+try {
+    if ([NvmlWrapper]::nvmlDeviceGetPowerManagementLimitConstraints($dev, [ref]$plMin, [ref]$plMax) -ne 0) {
+        $plMax = 0
+    }
+} catch { $plMax = 0 }
+
+# Failover: donanım raporlamazsa form-factor default’u kullan
+if ($plMax -le 0) { $plMax = if ($ff -eq 'Laptop') { 120000 } else { 160000 } }
+
+# Tek seferlik güç çarpanı
+[double]$PowerFac = [math]::Pow(([double]$plMax)/$P_ref, $PowExp)
 $score = [math]::Round([double]$score * $PowerFac, 4)
 
+
+
+# -------------------------------
+# Tek seferlik mobil uplift (ılımlı)
+# -------------------------------
+# Mimari-bazlı taban uplift + TGP kovası: MAX constraint'e göre
+if (-not (Get-Variable -Name MobileBoost -Scope Script -ErrorAction SilentlyContinue)) {
+  $script:MobileBoost = @{
+    Default   = 1.06
+    Turing    = 1.05
+    Ampere    = 1.06
+    Ada       = 1.07
+    Blackwell = 1.05
+  }
+}
+
+function Get-MobileBoost {
+  param([string]$arch, [uint32]$pMaxLocal)
+
+  # taban değer
+  [double]$b = 1.06
+  if ($script:MobileBoost -and $script:MobileBoost.ContainsKey($arch)) {
+    $b = [double]$script:MobileBoost[$arch]
+  }
+
+  if     ($pMaxLocal -lt  90000) { $b *= 1.10 }
+  elseif ($pMaxLocal -lt 110000) { $b *= 1.06 }
+  elseif ($pMaxLocal -lt 130000) { $b *= 1.03 }
+  else                           { $b *= 1.01 }
+
+  return [double]$b
+}
+
+
 if ($ff -eq 'Laptop') {
-  [double]$baseUplift = Get-MobileBoost -arch $arch -pl $pl
-  [double]$target     = [double]$Ref4060Score * (1.0 + [double]$script:LaptopTargetMargin)
-  [double]$need       = $target / ([double]$score * $baseUplift)
-  if ($need -lt 1.0) { $need = 1.0 }
-  [double]$uplift = $baseUplift * $need
-  if ($uplift -gt [double]$script:LaptopUpliftCap) { $uplift = [double]$script:LaptopUpliftCap }
+  [double]$uplift = Get-MobileBoost -arch $arch -plMaxLocal $plMax
   $score = [math]::Round([double]$score * $uplift, 4)
 }
+
+
 
 # Nihai skorun globalleştirilmesi (grafik için)
 $script:FinalScore = [double]$score
@@ -365,13 +448,6 @@ if ($ff -eq 'Laptop') {
 $script:FinalScore = [double]$score
 $script:score      = [double]$score   # geriye dönük uyumluluk
 $script:name       = [string]$name    # etiket için
-
-
-[string]$ff = if (Get-Command Get-FormFactorTag -ErrorAction SilentlyContinue) {
-  Get-FormFactorTag -gpuName $name
-} else {
-  if ($name -match $script:MobileNamePatterns) { 'Laptop' } else { 'Desktop' }
-}
 
 [double]$P_ref  = [double]$FormFactor[$ff].P_ref
 [double]$PowExp = [double]$FormFactor[$ff].Exp
