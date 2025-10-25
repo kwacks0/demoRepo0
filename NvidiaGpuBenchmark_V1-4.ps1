@@ -7,43 +7,24 @@
 # ================================
 # ExecutionPolicy Bootstrap (Self)
 # ================================
-# Aynı blok iki kez çalışmasın
 if (-not $env:__GPU_BOOT_DONE) {
   $env:__GPU_BOOT_DONE = "1"
-
-  # İmzasız/indirilen dosya engelini temizle (sessiz)
   try { if ($PSCommandPath) { Unblock-File -Path $PSCommandPath -ErrorAction Stop } } catch {}
-
-  # Önce Process scope'ta Bypass dene
   try {
     if ((Get-ExecutionPolicy -Scope Process) -ne 'Bypass') {
       Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop
     }
   } catch {}
-
-  # Etkili policy Bypass değilse kendini Bypass ile yeniden başlat
   $needRelaunch = $true
   try { if ((Get-ExecutionPolicy) -eq 'Bypass') { $needRelaunch = $false } } catch {}
-
   if ($needRelaunch -and $PSCommandPath) {
-    # Çalıştırılacak PowerShell yolu (önce pwsh, yoksa Windows PowerShell)
     $psExe = $null
     try { $psExe = (Get-Command pwsh -ErrorAction Stop).Source } catch {}
-    if (-not $psExe) {
-      $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    }
-
-    # Argümanları koruyarak yeniden çağır
+    if (-not $psExe) { $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe' }
     $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"") + $args
-    try {
-      & $psExe @argList
-      exit $LASTEXITCODE
-    } catch {
-      # Yeniden başlatma başarısızsa mevcut oturumda devam
-    }
+    try { & $psExe @argList; exit $LASTEXITCODE } catch {}
   }
 }
-
 
 # -- NVML P/Invoke türünü yalnızca bir kez ekle --
 if (-not ('NvmlWrapper' -as [type])) {
@@ -53,14 +34,13 @@ using System.Runtime.InteropServices;
 public static class NvmlWrapper {
     [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)]
     public static extern int nvmlInit_v2();
+
     [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)]
     public static extern int nvmlShutdown();
 
-    # NvmlWrapper içine ekle
-[DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)]
-public static extern int nvmlDeviceGetPowerManagementLimitConstraints(
-    IntPtr device, out uint minLimitMilliWatts, out uint maxLimitMilliWatts);
-
+    [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern int nvmlDeviceGetPowerManagementLimitConstraints(
+        IntPtr device, out uint minLimitMilliWatts, out uint maxLimitMilliWatts);
 
     [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)]
     public static extern int nvmlDeviceGetHandleByIndex_v2(uint index, out IntPtr device);
@@ -71,13 +51,14 @@ public static extern int nvmlDeviceGetPowerManagementLimitConstraints(
     [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)]
     public static extern int nvmlDeviceGetCudaComputeCapability(IntPtr device, out int major, out int minor);
 
-    // Bu entry NVML her sürümde yok; try/catch ile korunacak
+    // Opsiyonel; bazı NVML sürümlerinde yok
     [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl, EntryPoint="nvmlDeviceGetNumGpuCores")]
     public static extern int nvmlDeviceGetNumGpuCores(IntPtr device, out uint numCores);
 
-    // Attributes V2 çoğu yeni NVML’de var; değilse V1’e düş
+    // Attributes V2 yoksa V1'e düş
     [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl, EntryPoint="nvmlDeviceGetAttributes_v2")]
     public static extern int nvmlDeviceGetAttributes_v2(IntPtr device, out DeviceAttributes attributes);
+
     [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl, EntryPoint="nvmlDeviceGetAttributes")]
     public static extern int nvmlDeviceGetAttributes(IntPtr device, out DeviceAttributes attributes);
 
@@ -172,141 +153,82 @@ function Get-ArchFromCC($major,$minor){
   }
 }
 
-# --- Form factor + mobil yükseltme (GLOBAL) ---
-if (-not (Get-Variable -Name FormFactor -Scope Script -ErrorAction SilentlyContinue)) {
-  $script:FormFactor = @{
-    Laptop  = @{ P_ref = 120000.0; Exp = 0.18 }
-    Desktop = @{ P_ref = 160000.0; Exp = 0.25 }
-  }
+# --- Form factor profilleri + tag ---
+$script:FormFactor = @{
+  Laptop  = @{ P_ref = 120000.0; Exp = 0.18 }
+  Desktop = @{ P_ref = 160000.0; Exp = 0.25 }
 }
 $script:MobileNamePatterns = '(?i)\b(Laptop|Notebook|Mobile|Max\-Q)\b'
-
-if (-not (Get-Command -Name Get-FormFactorTag -ErrorAction SilentlyContinue)) {
-  function Get-FormFactorTag {
-    param([string]$gpuName)
-    if ([string]::IsNullOrWhiteSpace($gpuName)) { return 'Desktop' }
-    if ($gpuName -match $script:MobileNamePatterns) { return 'Laptop' }
-    return 'Desktop'
-  }
+function Get-FormFactorTag { param([string]$gpuName)
+  if ([string]::IsNullOrWhiteSpace($gpuName)) { return 'Desktop' }
+  if ($gpuName -match $script:MobileNamePatterns) { return 'Laptop' }
+  'Desktop'
 }
 
-# --- Form factor + mobil uplift + hedef ---
-if (-not (Get-Variable -Name FormFactor -Scope Script -ErrorAction SilentlyContinue)) {
-  $script:FormFactor = @{
-    Laptop  = @{ P_ref = 120000.0; Exp = 0.18 }
-    Desktop = @{ P_ref = 160000.0; Exp = 0.25 }
-  }
+# --- Mobil uplift ---
+$script:MobileBoost = @{
+  Default   = 1.06
+  Turing    = 1.05
+  Ampere    = 1.06
+  Ada       = 1.07
+  Blackwell = 1.05
 }
-$script:MobileNamePatterns = '(?i)\b(Laptop|Notebook|Mobile|Max\-Q)\b'
-
-if (-not (Get-Command -Name Get-FormFactorTag -ErrorAction SilentlyContinue)) {
-  function Get-FormFactorTag {
-    param([string]$gpuName)
-    if ([string]::IsNullOrWhiteSpace($gpuName)) { return 'Desktop' }
-    if ($gpuName -match $script:MobileNamePatterns) { return 'Laptop' }
-    return 'Desktop'
-  }
-}
-
-# Mimari-bazlı taban uplift
-if (-not (Get-Variable -Name MobileBoost -Scope Script -ErrorAction SilentlyContinue)) {
-  $script:MobileBoost = @{
-    Default    = 1.12
-    Turing     = 1.14
-    Ampere     = 1.15
-    Ada        = 1.17
-    Blackwell  = 1.22   # 5070 Laptop için taban yüksek
-  }
-}
-if (-not (Get-Command -Name Get-MobileBoost -ErrorAction SilentlyContinue)) {
-  function Get-MobileBoost {
-    param([string]$arch,[uint32]$pl)
-    [double]$b = if ($script:MobileBoost.ContainsKey($arch)) { [double]$script:MobileBoost[$arch] } else { [double]$script:MobileBoost['Default'] }
-    if ($pl -gt 0) {
-      if     ($pl -lt 90000)  { $b *= 1.12 }
-      elseif ($pl -lt 110000) { $b *= 1.08 }
-      elseif ($pl -lt 130000) { $b *= 1.04 }
-      else                    { $b *= 1.02 }
-    }
-    return $b
-  }
+function Get-MobileBoost {
+  param([string]$arch, [uint32]$plMaxLocal)
+  [double]$b = 1.06
+  if ($script:MobileBoost.ContainsKey($arch)) { $b = [double]$script:MobileBoost[$arch] }
+  if     ($plMaxLocal -lt  90000) { $b *= 1.10 }
+  elseif ($plMaxLocal -lt 110000) { $b *= 1.06 }
+  elseif ($plMaxLocal -lt 130000) { $b *= 1.03 }
+  else                            { $b *= 1.01 }
+  return [double]$b
 }
 
-# --- Hedef: 4060 Desktop skorunu referans al ---
-# 4060 spec: 3072 CUDA, 2460 MHz SM, 17000 memclk, 128-bit, Ada, DDRfactor=1
-[double]$ref4060_tf    = (3072 * 2.0 * 2460) / 1e6
-[double]$ref4060_rawBW = ((128)/8.0) * 17000 * 1.0 / 1000.0
-[double]$ref4060_comp  = Compute-Composite -tf $ref4060_tf -rawBW $ref4060_rawBW -arch 'Ada'
-[double]$Ref4060Score  = [double](Score-FromComposite $ref4060_comp)
-
-# Otomatik hedef parametreleri (küresel)
-$script:LaptopTargetMargin = 0.03   # %3 yukarı
-$script:LaptopUpliftCap    = 1.70   # güvenlik tavanı
-
-
-# Mimari-bazlı mobil uplift + TGP kovası
-if (-not (Get-Variable -Name MobileBoost -Scope Script -ErrorAction SilentlyContinue)) {
-  $script:MobileBoost = @{
-    Default    = 1.12
-    Turing     = 1.12
-    Ampere     = 1.14
-    Ada        = 1.16
-    Blackwell  = 1.18   # 5070 Laptop hedefi için
-  }
-}
-if (-not (Get-Command -Name Get-MobileBoost -ErrorAction SilentlyContinue)) {
-  function Get-MobileBoost {
-    param([string]$arch,[uint32]$pl)
-    [double]$b = if ($script:MobileBoost.ContainsKey($arch)) { [double]$script:MobileBoost[$arch] } else { [double]$script:MobileBoost['Default'] }
-    if ($pl -gt 0) {
-      if     ($pl -lt 90000)  { $b *= 1.10 }   # düşük TGP daha çok yükselsin
-      elseif ($pl -lt 110000) { $b *= 1.06 }
-      elseif ($pl -lt 130000) { $b *= 1.03 }
-      else                    { $b *= 1.01 }
-    }
-    return $b
-  }
-}
-
-
-# SM başına CUDA çekirdeği eşleşmesi – Ada/Blackwell düzeltildi
+# --- SM başına CUDA çekirdeği ---
 function Get-CudaPerSM($major,$minor){
   $key = "$major.$minor"
   switch ($key) {
-    # Blackwell (temkinli): 128 varsay
-    { $_ -like "9.*" } { return 128 }
+    { $_ -like "9.*" } { return 128 } # Blackwell (varsay)
     "8.9" { return 128 }  # Ada
     "8.6" { return 128 }  # Ampere GA106+
-    "7.5" { return 64 }   # Turing TU106+
-    "7.0" { return 64 }   # Turing TU102/TU104
+    "7.5" { return 64 }   # Turing
+    "7.0" { return 64 }   # Turing
     "6.1" { return 128 }  # Pascal GP104
-    "5.0" { return 128 }  # Maxwell GM107/GM204
+    "5.0" { return 128 }  # Maxwell
     default {
-      if ($major -le 2) { return 32 }
-      elseif ($major -eq 3) { return 192 }
-      else { return 128 }
+      if ($major -le 2)      { return 32 }
+      elseif ($major -eq 3)  { return 192 }
+      else                   { return 128 }
     }
   }
 }
 
-function Compute-Composite($tf,$rawBW,$arch){
+# --- Bileşik ve Skor fonksiyonları ---
+function Compute-Composite { param([double]$tf,[double]$rawBW,[string]$arch)
   $effBW = $rawBW * $CompFac[$arch]
-  $p1 = [math]::Pow([double]$tf,    [double]$alpha)
-  $p2 = [math]::Pow([double]$effBW, [double]$beta)
+  $p1 = [math]::Pow($tf,    [double]$alpha)
+  $p2 = [math]::Pow($effBW, [double]$beta)
   return $p1 * $p2 * $ArchEff[$arch] * $LegacyCal[$arch]
 }
 
-# --- Kalibrasyon (GTX1080 ↔ RTX5090) ---
+# Kalibrasyon (GTX1080 ↔ RTX5090)
 $B_Comp = 105.5
 $SB     = 10000/4.25
 $Z_Comp = 747.0
 $SZ     = 10000
 $Gamma  = ([math]::Log($SZ)-[math]::Log($SB)) / ([math]::Log($Z_Comp)-[math]::Log($B_Comp))
-function Score-FromComposite($C){
-  if ([double]$C -le 0) { return 0.0 }
-  $y = [math]::Log($SB) + $Gamma * ([math]::Log([double]$C) - [math]::Log($B_Comp))
+
+function Score-FromComposite { param([double]$C)
+  if ($C -le 0) { return 0.0 }
+  $y = [math]::Log($SB) + $Gamma * ([math]::Log($C) - [math]::Log($B_Comp))
   [math]::Round([math]::Exp($y), 4)
 }
+
+# --- Ref 4060 skor hedefi (fonksiyonlar tanımlandıktan sonra) ---
+[double]$ref4060_tf    = (3072 * 2.0 * 2460) / 1e6
+[double]$ref4060_rawBW = ((128)/8.0) * 17000 * 1.0 / 1000.0
+[double]$ref4060_comp  = Compute-Composite -tf $ref4060_tf -rawBW $ref4060_rawBW -arch 'Ada'
+[double]$Ref4060Score  = [double](Score-FromComposite $ref4060_comp)
 
 # =================
 # NVML Oku + Skor
@@ -331,9 +253,7 @@ try {
     $n=[uint32]0
     $r=[NvmlWrapper]::nvmlDeviceGetNumGpuCores($dev,[ref]$n)
     if ($r -eq 0 -and $n -gt 0) { $cuda = [int]$n }
-  } catch [System.EntryPointNotFoundException] {
-    $cuda = 0
-  }
+  } catch [System.EntryPointNotFoundException] { $cuda = 0 }
   if ($cuda -le 0) {
     $attrs = New-Object NvmlWrapper+DeviceAttributes
     $ok = [NvmlWrapper]::nvmlDeviceGetAttributes_v2($dev,[ref]$attrs)
@@ -359,122 +279,47 @@ try {
   $bwrc = [NvmlWrapper]::nvmlDeviceGetMemoryBusWidth($dev,[ref]$busW)
   $busWidth = if ($bwrc -eq 0 -and $busW -gt 0) { [int]$busW } else { 128 }
 
-  # DDR faktörü – modern mimarilerde NVML çoğu kez efektif clock verir; tekrar ×2 yapma
-  $ddrFactor =
-    if ($arch -in @("Tesla","Fermi","Kepler","Maxwell","Pascal")) { 2.0 } else { 1.0 }
+  # DDR faktörü
+  $ddrFactor = if ($arch -in @("Tesla","Fermi","Kepler","Maxwell","Pascal")) { 2.0 } else { 1.0 }
 
-  # Bant genişliği (GB/s) = (BusWidth/8) * MemClock(MHz) * DDRfactor / 1000
+  # Bant genişliği (GB/s)
   $rawBW = (([double]$busWidth)/8.0) * ([double]$memClk) * $ddrFactor / 1000.0
 
-  # Hesap ve skor
+  # Hesap ve skor (ön-normalizasyon)
   $comp  = Compute-Composite -tf $tf -rawBW $rawBW -arch $arch
   $score = Score-FromComposite $comp
 
-# -------------------------------
-# Mode-proof güç normalizasyonu
-# -------------------------------
-# Form factor
-[string]$ff = Get-FormFactorTag -gpuName $name
-[double]$P_ref  = [double]$FormFactor[$ff].P_ref    # Laptop:120000, Desktop:160000
-[double]$PowExp = [double]$FormFactor[$ff].Exp
+  # -------------------------------
+  # Mode-proof güç normalizasyonu
+  # -------------------------------
+  [string]$ff = Get-FormFactorTag -gpuName $name
+  [double]$P_ref  = [double]$FormFactor[$ff].P_ref
+  [double]$PowExp = [double]$FormFactor[$ff].Exp
 
-# Kartın donanımsal PL üst sınırını al (mode'dan bağımsız)
-[uint32]$plMax = 0; [uint32]$plMin = 0
-try {
+  # Kartın donanımsal PL üst sınırı (constraint maksimum)
+  [uint32]$plMax = 0; [uint32]$plMin = 0
+  try {
     if ([NvmlWrapper]::nvmlDeviceGetPowerManagementLimitConstraints($dev, [ref]$plMin, [ref]$plMax) -ne 0) {
-        $plMax = 0
+      $plMax = 0
     }
-} catch { $plMax = 0 }
+  } catch { $plMax = 0 }
 
-# Failover: donanım raporlamazsa form-factor default’u kullan
-if ($plMax -le 0) { $plMax = if ($ff -eq 'Laptop') { 120000 } else { 160000 } }
+  if ($plMax -le 0) { $plMax = if ($ff -eq 'Laptop') { 120000 } else { 160000 } }
 
-# Tek seferlik güç çarpanı
-[double]$PowerFac = [math]::Pow(([double]$plMax)/$P_ref, $PowExp)
-$score = [math]::Round([double]$score * $PowerFac, 4)
+  # Güç çarpanı
+  [double]$PowerFac = [math]::Pow(([double]$plMax)/$P_ref, $PowExp)
+  $score = [math]::Round([double]$score * $PowerFac, 4)
 
-
-
-# -------------------------------
-# Tek seferlik mobil uplift (ılımlı)
-# -------------------------------
-# Mimari-bazlı taban uplift + TGP kovası: MAX constraint'e göre
-if (-not (Get-Variable -Name MobileBoost -Scope Script -ErrorAction SilentlyContinue)) {
-  $script:MobileBoost = @{
-    Default   = 1.06
-    Turing    = 1.05
-    Ampere    = 1.06
-    Ada       = 1.07
-    Blackwell = 1.05
-  }
-}
-
-function Get-MobileBoost {
-  param([string]$arch, [uint32]$pMaxLocal)
-
-  # taban değer
-  [double]$b = 1.06
-  if ($script:MobileBoost -and $script:MobileBoost.ContainsKey($arch)) {
-    $b = [double]$script:MobileBoost[$arch]
+  # Tek seferlik mobil uplift
+  if ($ff -eq 'Laptop') {
+    [double]$uplift = Get-MobileBoost -arch $arch -plMaxLocal $plMax
+    $score = [math]::Round([double]$score * $uplift, 4)
   }
 
-  if     ($pMaxLocal -lt  90000) { $b *= 1.10 }
-  elseif ($pMaxLocal -lt 110000) { $b *= 1.06 }
-  elseif ($pMaxLocal -lt 130000) { $b *= 1.03 }
-  else                           { $b *= 1.01 }
-
-  return [double]$b
-}
-
-
-if ($ff -eq 'Laptop') {
-  [double]$uplift = Get-MobileBoost -arch $arch -plMaxLocal $plMax
-  $score = [math]::Round([double]$score * $uplift, 4)
-}
-
-
-
-# Nihai skorun globalleştirilmesi (grafik için)
-$script:FinalScore = [double]$score
-$script:score      = [double]$score
-$script:name       = [string]$name
-
-# --- Mobil uplift uygula ---
-if ($ff -eq 'Laptop') {
-  [double]$uplift = Get-MobileBoost -arch $arch -pl $pl
-  $score = [math]::Round([double]$score * $uplift, 4)
-}
-# --- nihai skorun scope'a sabitlenmesi ---
-$script:FinalScore = [double]$score
-$script:score      = [double]$score   # geriye dönük uyumluluk
-$script:name       = [string]$name    # etiket için
-
-[double]$P_ref  = [double]$FormFactor[$ff].P_ref
-[double]$PowExp = [double]$FormFactor[$ff].Exp
-if ($pl -le 0) { $pl = if ($ff -eq 'Laptop') { 120000 } else { 160000 } }
-
-[double]$PowerFac = [math]::Pow(([double]$pl)/$P_ref, $PowExp)
-$score = [math]::Round([double]$score * $PowerFac, 4)
-
-
-# Form factor belirle ve profil çek
-$ff = Get-FormFactorTag $name
-$P_ref = [double]$FormFactor[$ff].P_ref
-$PowExp = [double]$FormFactor[$ff].Exp
-
-# Güç bilgisi yoksa makul default ata (mobil için 120 W, masaüstü için 160 W)
-if ($pl -le 0) {
-    $pl = if ($ff -eq 'Laptop') { 120000 } else { 160000 }
-}
-
-# Son güç çarpanı
-$PowerFac = [math]::Pow(([double]$pl)/$P_ref, $PowExp)
-$score = [math]::Round($score * $PowerFac, 4)
-
-  # Referans masaüstü orta sınıfı 160W; üssü düşür (0.25) → aşırı ceza kalkar
-  $P_ref = 160000.0
-  $PowerFac = [math]::Pow(([double]$pl)/$P_ref, 0.25)
-  $score = [math]::Round($score * $PowerFac, 4)
+  # Nihai skorun globalleştirilmesi
+  $script:FinalScore = [double]$score
+  $script:score      = [double]$score
+  $script:name       = [string]$name
 
   # Çıktı
   Write-Output "GPU: $name"
@@ -494,10 +339,9 @@ $score = [math]::Round($score * $PowerFac, 4)
 }
 
 # ==========================
-# GPU Skor Grafiği (APPEND)
+# Yardımcılar: skor/etiket
 # ==========================
 function Get-UserGpuLabelAndScore {
-    # Etiket (script scope'tan)
     $userLabel = $null
     foreach ($nm in 'name','gpuName','active') {
         if (Get-Variable -Scope Script -Name $nm -ErrorAction SilentlyContinue) {
@@ -509,7 +353,6 @@ function Get-UserGpuLabelAndScore {
     }
     if ([string]::IsNullOrWhiteSpace($userLabel)) { $userLabel = 'My GPU' }
 
-    # Skor (önce FinalScore, sonra geriye dönük değişkenler)
     $userScore = $null
     foreach ($v in 'FinalScore','score','activeScore','Score') {
         if (Get-Variable -Scope Script -Name $v -ErrorAction SilentlyContinue) {
@@ -517,68 +360,15 @@ function Get-UserGpuLabelAndScore {
             if ($null -ne $userScore -and -not [double]::IsNaN($userScore)) { break }
         }
     }
-
-    # Son çare: comp'tan türet (güç/uplift yok; sadece fallback)
     if ($null -eq $userScore -and (Get-Variable -Scope Script -Name 'comp' -ErrorAction SilentlyContinue)) {
-        try {
-            [double]$c = [double](Get-Variable -Scope Script -Name 'comp' -ValueOnly)
-            $userScore = [double](Score-FromComposite $c)
-        } catch {}
+        try { [double]$c = [double](Get-Variable -Scope Script -Name 'comp' -ValueOnly)
+              $userScore = [double](Score-FromComposite $c) } catch {}
     }
-
     if ($null -eq $userScore -or [double]::IsNaN($userScore)) {
         $userScore = 0.0
         $userLabel = "$userLabel (score not found)"
     }
-
     [PSCustomObject]@{ Label = $userLabel; Score = $userScore }
-}
-
-
-$refs = @(
-  @{ Name="GTX 1050 (Desktop)"; CUDA=640;  SMclk=1455; Memclk=7000;  Bus=128; Arch="Pascal"    },
-  @{ Name="RTX 2060 (Desktop)"; CUDA=1920; SMclk=1680; Memclk=14000; Bus=192; Arch="Turing"    },
-  @{ Name="RTX 3050 (Desktop)"; CUDA=2560; SMclk=1777; Memclk=14000; Bus=128; Arch="Ampere"    },
-  @{ Name="RTX 4060 (Desktop)"; CUDA=3072; SMclk=2460; Memclk=17000; Bus=128; Arch="Ada"       },
-  @{ Name="RTX 5060 (Desktop)"; CUDA=3584; SMclk=2600; Memclk=21000; Bus=192; Arch="Blackwell" }
-)
-
-$gpuScores = [ordered]@{}
-foreach($r in $refs){
-    $s = Score-FromSpecs $r
-    $gpuScores[$s.Label] = [double]$s.Score
-}
-
-$user = Get-UserGpuLabelAndScore
-$userKey = if ($gpuScores.Contains($user.Label)) { "$($user.Label) • mine" } else { "$($user.Label) (My GPU)" }
-$gpuScores[$userKey] = [double]$user.Score
-
-# ==========================
-# GPU Skor Grafiği (APPEND) — SAFE
-# ==========================
-function Get-UserGpuLabelAndScore {
-    $userLabel = $null
-    if (Get-Variable -Name name -ErrorAction SilentlyContinue)        { $userLabel = [string]$name }
-    elseif (Get-Variable -Name gpuName -ErrorAction SilentlyContinue) { $userLabel = [string]$gpuName }
-    elseif (Get-Variable -Name active -ErrorAction SilentlyContinue)  { try { $userLabel = [string]$active.Name } catch {} }
-    if ([string]::IsNullOrWhiteSpace($userLabel)) { $userLabel = "My GPU" }
-
-    $userScore = $null
-    foreach ($v in 'score','activeScore','Score') {
-        if (Get-Variable -Name $v -ErrorAction SilentlyContinue) {
-            try { $userScore = [double](Get-Variable -Name $v -ValueOnly) } catch {}
-            if ($userScore -ne $null) { break }
-        }
-    }
-    if ($null -eq $userScore -and (Get-Variable -Name comp -ErrorAction SilentlyContinue) `
-        -and (Get-Command -Name Score-FromComposite -ErrorAction SilentlyContinue)) {
-        try { $userScore = [double](Score-FromComposite ([double]$comp)) } catch {}
-    }
-    if ($null -eq $userScore -or [double]::IsNaN([double]$userScore)) {
-        $userScore = 0.0
-        $userLabel = "$userLabel (score not found)"
-    }
-    [PSCustomObject]@{ Label = [string]$userLabel; Score = [double]$userScore }
 }
 
 function Score-FromSpecs($r){
@@ -589,6 +379,9 @@ function Score-FromSpecs($r){
     [PSCustomObject]@{ Label=[string]$r.Name; Score=[double](Score-FromComposite $c) }
 }
 
+# ==========================
+# GPU Skor Grafiği (APPEND)
+# ==========================
 $refs = @(
   @{ Name="GTX 1050 (Desktop)"; CUDA=640;  SMclk=1455; Memclk=7000;  Bus=128; Arch="Pascal"    },
   @{ Name="RTX 2060 (Desktop)"; CUDA=1920; SMclk=1680; Memclk=14000; Bus=192; Arch="Turing"    },
@@ -604,20 +397,16 @@ $user = Get-UserGpuLabelAndScore
 $userKey = if ($gpuScores.Contains($user.Label)) { "$($user.Label) • mine" } else { "$($user.Label) (My GPU)" }
 $gpuScores[[string]$userKey] = [double]$user.Score
 
-# ---- Grafik çizimi + PNG kaydı (tip güvenli) ----
 [string]$desktop = [Environment]::GetFolderPath("Desktop")
 [string]$outfile = Join-Path $desktop ("GPU_Scores_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".png")
 
 try {
     Add-Type -AssemblyName System.Drawing -ErrorAction Stop
-
-    # Dizileri güçlü tiple
     [string[]]$labels = @($gpuScores.Keys | ForEach-Object { [string]$_ })
     [double[]]$values = @($labels | ForEach-Object { [double]$gpuScores[$_] })
     [int]$n = [int]$labels.Length
     if ($n -le 0) { throw "No data" }
 
-    # Tuval ve metrikler
     [int]$bmpW = 1200
     [int]$bmpH = 640
     [int]$margin = 80
@@ -638,18 +427,14 @@ try {
     [int]$barW  = [int]([math]::Max(6, ([math]::Floor($plotW / [math]::Max(1,$n)) - 10)))
     [int]$x = [int]$margin
 
-    $g.DrawString("GPU Puanları Karşılaştırma", $fntTitle,
-        [System.Drawing.Brushes]::Black, [int]20, [int]15)
+    $g.DrawString("GPU Puanları Karşılaştırma", $fntTitle, [System.Drawing.Brushes]::Black, [int]20, [int]15)
 
     for ([int]$i=0; $i -lt $n; $i++) {
         [double]$val = [double]$values[$i]
         [int]$h = [int]([math]::Floor($plotH * ($val / $maxScore)))
-
         $rect = New-Object System.Drawing.Rectangle(
-            [int]$x,
-            [int]([int]$bmpH - [int]$margin - [int]$h),
-            [int]$barW,
-            [int]$h
+            [int]$x, [int]([int]$bmpH - [int]$margin - [int]$h),
+            [int]$barW, [int]$h
         )
         $g.FillRectangle([System.Drawing.Brushes]::Gray, $rect)
         $g.DrawRectangle([System.Drawing.Pens]::Black, $rect)
